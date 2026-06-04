@@ -227,6 +227,71 @@ func dumpAXHierarchy(element: AXUIElement, indent: String = "", maxDepth: Int = 
     }
 }
 
+/// Find the modal sheet (e.g. the Hide My Email panel) within a root element.
+func findSheet(in root: AXUIElement) -> AXUIElement? {
+    return findAXElement(in: root) { elem in
+        var role: AnyObject?
+        _ = AXUIElementCopyAttributeValue(elem, kAXRoleAttribute as CFString, &role)
+        return (role as? String) == "AXSheet"
+    }
+}
+
+/// Predicate that identifies the "+" / add button used to create a new address.
+/// Standard macOS add buttons (NSAddTemplate) expose an accessibility
+/// description of "add"; we also accept a literal "+" title to be safe.
+/// Exact matches are used to avoid false positives like the
+/// "Deactivate email address" button (which contains the substring "add").
+func isAddButton(_ elem: AXUIElement) -> Bool {
+    var role: AnyObject?
+    _ = AXUIElementCopyAttributeValue(elem, kAXRoleAttribute as CFString, &role)
+    guard (role as? String) == "AXButton" else { return false }
+
+    let attrs = getAXAttributes(elem)
+    let title = attrs.title.trimmingCharacters(in: .whitespacesAndNewlines)
+    let titleLower = title.lowercased()
+    let desc = attrs.desc.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    let id = attrs.id.lowercased()
+
+    // The Hide My Email sheet is a WebKit view; its add control is an
+    // AXButton labelled "Create New Address" rather than a native "+" button.
+    if titleLower.contains("create new address") || titleLower.contains("new address") { return true }
+    if desc.contains("create new address") || desc.contains("new address") { return true }
+
+    // Native macOS add buttons (NSAddTemplate) expose a "+" title or an
+    // accessibility description of "add".
+    if title == "+" { return true }
+    if desc == "add" || desc == "add item" || desc == "new" { return true }
+    if id == "add" || id.hasSuffix(":add") || id.hasSuffix("addbutton") { return true }
+    return false
+}
+
+/// Locate the "+" (add) button inside the Hide My Email sheet and press it.
+/// Retries for a few seconds because the sheet may still be rendering.
+func pressAddButton(in appRoot: AXUIElement) -> Bool {
+    for attempt in 1...5 {
+        // Prefer searching within the sheet to reduce false positives.
+        let searchRoot = findSheet(in: appRoot) ?? appRoot
+
+        if let addButton = findAXElement(in: searchRoot, predicate: isAddButton) {
+            print("Found '+' add button (attempt \(attempt)), pressing...")
+            if AXUIElementPerformAction(addButton, kAXPressAction as CFString) == .success {
+                return true
+            }
+            print("\u{2717} Press failed, will retry...")
+        } else {
+            print("  '+' button not found yet (\(attempt)/5)...")
+        }
+        sleep(1)
+    }
+
+    // Debug aid: dump the sheet so we can see the actual button attributes.
+    if let sheet = findSheet(in: appRoot) {
+        print("\nDumping Hide My Email sheet hierarchy for debugging...")
+        try? dumpAXHierarchy(element: sheet, maxDepth: 6)
+    }
+    return false
+}
+
 // MARK: - Main logic
 
 print("Starting HideMyEmailClicker...")
@@ -491,7 +556,19 @@ while let elem = clickable {
        acts.contains(kAXPressAction as String) {
         AXUIElementPerformAction(elem, kAXPressAction as CFString)
         print("✔︎ Hide My Email clicked")
-        exit(0)
+
+        // The click opens the "Hide My Email" sheet. Now press the "+" (add)
+        // button in that sheet to start creating a new address.
+        print("Waiting for Hide My Email sheet to appear (2 seconds)...")
+        sleep(2)
+
+        if pressAddButton(in: settingsAX) {
+            print("✔︎ '+' (add) button pressed")
+            exit(0)
+        } else {
+            print("✘ Could not find or press the '+' button – UI may have changed.")
+            exit(1)
+        }
     }
     var parent: AnyObject?
     if AXUIElementCopyAttributeValue(elem, kAXParentAttribute as CFString, &parent) != .success {
