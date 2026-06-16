@@ -1,10 +1,12 @@
 // HideMyEmailClicker.swift
 // macOS Sonoma (15.x) – Clicks the “Hide My Email” tile in System Settings
 // Build:  swiftc HideMyEmailClicker.swift -o HideMyEmailClicker
-// Usage: ./HideMyEmailClicker  (after granting Accessibility permission)
+// Usage: ./HideMyEmailClicker [label text]  (after granting Accessibility permission)
+//   The optional [label text] is typed into the LABEL field of the new address.
 
 import Cocoa
 import ApplicationServices
+import CoreGraphics
 
 // MARK: - Helper functions
 
@@ -292,11 +294,105 @@ func pressAddButton(in appRoot: AXUIElement) -> Bool {
     return false
 }
 
+/// Read a single string attribute, returning "" when absent.
+func stringAttr(_ elem: AXUIElement, _ attr: CFString) -> String {
+    var v: AnyObject?
+    _ = AXUIElementCopyAttributeValue(elem, attr, &v)
+    return (v as? String) ?? ""
+}
+
+/// Predicate that identifies the LABEL text field in the "new address" dialog.
+/// That field's placeholder is "Label Your Email"; the NOTE field's placeholder
+/// is "Make a Note (Optional)", so matching on "label" is unambiguous.
+func isLabelField(_ elem: AXUIElement) -> Bool {
+    var role: AnyObject?
+    _ = AXUIElementCopyAttributeValue(elem, kAXRoleAttribute as CFString, &role)
+    let roleStr = (role as? String) ?? ""
+    guard roleStr == "AXTextField" || roleStr == "AXTextArea" else { return false }
+
+    let haystacks = [
+        stringAttr(elem, kAXPlaceholderValueAttribute as CFString),
+        stringAttr(elem, kAXTitleAttribute as CFString),
+        stringAttr(elem, kAXDescriptionAttribute as CFString),
+        stringAttr(elem, kAXIdentifierAttribute as CFString),
+        stringAttr(elem, kAXHelpAttribute as CFString),
+    ].map { $0.lowercased() }
+
+    return haystacks.contains { $0.contains("label") }
+}
+
+/// Type a string into the currently focused field using synthesized key events.
+/// Used as a fallback when setting AXValue directly does not take effect (common
+/// for WebKit-backed fields).
+func typeString(_ text: String) {
+    guard let src = CGEventSource(stateID: .hidSystemState) else { return }
+    for char in text {
+        var units = Array(String(char).utf16)
+        if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
+            down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
+            down.post(tap: .cghidEventTap)
+        }
+        if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+            up.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
+            up.post(tap: .cghidEventTap)
+        }
+        usleep(8000)
+    }
+}
+
+/// Locate the LABEL field in the "new address" dialog and fill it with `text`.
+/// Tries to set the value via accessibility first, then falls back to typing.
+func fillLabelField(in appRoot: AXUIElement, with text: String) -> Bool {
+    for attempt in 1...5 {
+        if let field = findAXElement(in: appRoot, predicate: isLabelField) {
+            print("Found LABEL field (attempt \(attempt)), filling it...")
+
+            // Focus the field so the app registers the edit.
+            AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            usleep(200_000)
+
+            // Attempt 1: set the value directly.
+            let setResult = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, text as CFTypeRef)
+            if setResult == .success, stringAttr(field, kAXValueAttribute as CFString) == text {
+                return true
+            }
+
+            // Attempt 2: type the text into the focused field.
+            print("Direct set didn't take; typing the text instead...")
+            typeString(text)
+            usleep(200_000)
+            let now = stringAttr(field, kAXValueAttribute as CFString)
+            if now == text || now.contains(text) {
+                return true
+            }
+            print("\u{2717} LABEL field still reads \"\(now)\" after typing; will retry...")
+        } else {
+            print("  LABEL field not found yet (\(attempt)/5)...")
+        }
+        sleep(1)
+    }
+
+    if let sheet = findSheet(in: appRoot) {
+        print("\nDumping new-address dialog hierarchy for debugging...")
+        try? dumpAXHierarchy(element: sheet, maxDepth: 8)
+    }
+    return false
+}
+
 // MARK: - Main logic
 
 print("Starting HideMyEmailClicker...")
 requireAccessibilityPermission()
 print("Accessibility permission confirmed")
+
+// Optional CLI argument: text used to fill the LABEL field of the new address.
+// All arguments are joined so the label can be passed with or without quoting.
+let labelText = CommandLine.arguments.dropFirst().joined(separator: " ")
+if labelText.isEmpty {
+    print("No LABEL argument provided; the LABEL field will be left empty.")
+} else {
+    print("LABEL argument: \"\(labelText)\"")
+}
 
 // Define retry parameters
 let maxRetries = 3
@@ -563,10 +659,25 @@ while let elem = clickable {
         sleep(2)
 
         if pressAddButton(in: settingsAX) {
-            print("✔︎ '+' (add) button pressed")
-            exit(0)
+            print("✔︎ 'Create New Address' button pressed")
+
+            if labelText.isEmpty {
+                exit(0)
+            }
+
+            // The add button opens the "new address" dialog with a LABEL field.
+            print("Waiting for the new-address dialog to appear (2 seconds)...")
+            sleep(2)
+
+            if fillLabelField(in: settingsAX, with: labelText) {
+                print("✔︎ LABEL field set to \"\(labelText)\"")
+                exit(0)
+            } else {
+                print("✘ Could not fill the LABEL field – UI may have changed.")
+                exit(1)
+            }
         } else {
-            print("✘ Could not find or press the '+' button – UI may have changed.")
+            print("✘ Could not find or press the 'Create New Address' button – UI may have changed.")
             exit(1)
         }
     }
